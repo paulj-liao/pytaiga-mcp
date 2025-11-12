@@ -1,5 +1,6 @@
 import pytest
 import uuid
+import time
 from unittest.mock import patch, MagicMock
 
 # Import the server module instead of specific functions
@@ -7,7 +8,7 @@ import src.server
 from src.taiga_client import TaigaClientWrapper
 
 # Test constants
-TEST_HOST = "https://your-test-taiga-instance.com" 
+TEST_HOST = "https://your-test-taiga-instance.com"
 TEST_USERNAME = "test_user"
 TEST_PASSWORD = "test_password"
 
@@ -15,16 +16,25 @@ class TestTaigaTools:
     @pytest.fixture
     def session_setup(self):
         """Create a session setup for testing"""
-        # Generate a session ID 
+        # Generate a session ID
         session_id = str(uuid.uuid4())
-        
+
         # Create and return a mock client
         mock_client = MagicMock()
         mock_client.is_authenticated = True
-        
-        # Store the mock client in active_sessions
-        src.server.active_sessions[session_id] = mock_client
-        
+
+        # Create SessionData with the mock client
+        now = time.time()
+        session_data = src.server.SessionData(
+            client=mock_client,
+            created_at=now,
+            last_activity=now,
+            username=TEST_USERNAME
+        )
+
+        # Store the session data in active_sessions
+        src.server.active_sessions[session_id] = session_data
+
         return session_id, mock_client
     
     def test_login(self):

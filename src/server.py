@@ -2,7 +2,14 @@
 import logging
 import logging.config
 import uuid
-from typing import Optional, List, Dict, Any
+import time
+import threading
+import os
+from collections import defaultdict
+from typing import Optional, List, Dict, Any, Tuple
+from urllib.parse import urlparse
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
 from pytaigaclient.exceptions import TaigaException
@@ -22,9 +29,139 @@ logger = logging.getLogger(__name__)
 # Quiet down pytaigaclient library logging if needed
 logging.getLogger("pytaigaclient").setLevel(logging.WARNING)
 
+# --- Security Configuration ---
+SESSION_EXPIRY = int(os.getenv("SESSION_EXPIRY", "28800"))  # 8 hours default
+SESSION_CLEANUP_INTERVAL = int(os.getenv("SESSION_CLEANUP_INTERVAL", "3600"))  # 1 hour
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+RATE_LIMIT_LOGIN_REQUESTS = int(os.getenv("RATE_LIMIT_LOGIN_REQUESTS", "5"))  # 5 login attempts
+RATE_LIMIT_LOGIN_WINDOW = int(os.getenv("RATE_LIMIT_LOGIN_WINDOW", "300"))  # per 5 minutes
+RATE_LIMIT_API_REQUESTS = int(os.getenv("RATE_LIMIT_API_REQUESTS", "100"))  # 100 API calls
+RATE_LIMIT_API_WINDOW = int(os.getenv("RATE_LIMIT_API_WINDOW", "60"))  # per minute
+MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "10000"))
+MAX_NAME_LENGTH = int(os.getenv("MAX_NAME_LENGTH", "255"))
+
+# --- Data Structures ---
+@dataclass
+class SessionData:
+    """Session data with expiration tracking"""
+    client: TaigaClientWrapper
+    created_at: float
+    last_activity: float
+    username: str
+
+    def is_expired(self) -> bool:
+        """Check if session has expired"""
+        return time.time() - self.last_activity > SESSION_EXPIRY
+
+    def update_activity(self):
+        """Update last activity timestamp"""
+        self.last_activity = time.time()
+
+# --- Rate Limiting ---
+class RateLimiter:
+    """Thread-safe rate limiter"""
+    def __init__(self, max_requests: int, window: int):
+        self.max_requests = max_requests
+        self.window = window
+        self.requests: Dict[str, List[float]] = defaultdict(list)
+        self.lock = threading.Lock()
+
+    def is_allowed(self, identifier: str) -> bool:
+        """Check if request is allowed for identifier"""
+        with self.lock:
+            now = time.time()
+            # Remove old requests outside the window
+            self.requests[identifier] = [
+                req_time for req_time in self.requests[identifier]
+                if now - req_time < self.window
+            ]
+
+            if len(self.requests[identifier]) >= self.max_requests:
+                return False
+
+            self.requests[identifier].append(now)
+            return True
+
+    def reset(self, identifier: str):
+        """Reset rate limit for identifier"""
+        with self.lock:
+            self.requests.pop(identifier, None)
+
+# Initialize rate limiters
+login_rate_limiter = RateLimiter(RATE_LIMIT_LOGIN_REQUESTS, RATE_LIMIT_LOGIN_WINDOW)
+api_rate_limiter = RateLimiter(RATE_LIMIT_API_REQUESTS, RATE_LIMIT_API_WINDOW)
+
+# --- Input Validation ---
+def validate_string_input(value: str, field_name: str, max_length: int = MAX_INPUT_LENGTH,
+                         min_length: int = 1, allow_empty: bool = False) -> str:
+    """Validate string input with length constraints"""
+    if value is None:
+        if allow_empty:
+            return ""
+        raise ValueError(f"{field_name} cannot be None")
+
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+
+    value = value.strip()
+
+    if not allow_empty and len(value) < min_length:
+        raise ValueError(f"{field_name} cannot be empty")
+
+    if len(value) > max_length:
+        raise ValueError(f"{field_name} too long (max {max_length} characters)")
+
+    return value
+
+def validate_host_url(host: str) -> str:
+    """Validate and sanitize host URL"""
+    host = validate_string_input(host, "Host URL", max_length=500)
+
+    try:
+        parsed = urlparse(host)
+    except Exception as e:
+        raise ValueError(f"Invalid host URL: {e}")
+
+    # Ensure scheme is present
+    if not parsed.scheme:
+        raise ValueError("Host URL must include protocol (http:// or https://)")
+
+    # Ensure it's HTTP or HTTPS
+    if parsed.scheme not in ['http', 'https']:
+        raise ValueError("Host URL must use HTTP or HTTPS protocol")
+
+    # Warn on HTTP for non-localhost
+    if parsed.scheme == 'http' and not parsed.netloc.startswith('localhost') and not parsed.netloc.startswith('127.0.0.1'):
+        logger.warning(f"Using unencrypted HTTP connection to {parsed.netloc} - this is insecure for production!")
+
+    # Ensure netloc exists
+    if not parsed.netloc:
+        raise ValueError("Host URL must include a valid domain or IP address")
+
+    return host
+
+def validate_project_name(name: str) -> str:
+    """Validate project name"""
+    return validate_string_input(name, "Project name", max_length=MAX_NAME_LENGTH)
+
+def validate_email(email: str) -> str:
+    """Basic email validation"""
+    email = validate_string_input(email, "Email", max_length=254)
+
+    if '@' not in email or '.' not in email.split('@')[1]:
+        raise ValueError("Invalid email format")
+
+    return email
+
+def hash_for_logging(value: str) -> str:
+    """Hash a value for safe logging"""
+    import hashlib
+    return hashlib.sha256(value.encode()).hexdigest()[:8]
+
 # --- Manual Session Management ---
-# Store active sessions: session_id -> TaigaClientWrapper instance
-active_sessions: Dict[str, TaigaClientWrapper] = {}
+# Store active sessions: session_id -> SessionData instance
+active_sessions: Dict[str, SessionData] = {}
+session_lock = threading.Lock()
 
 # --- MCP Server Definition ---
 # No lifespan needed for this approach
@@ -32,6 +169,33 @@ mcp = FastMCP(
     "Taiga Bridge (Session ID)",
     dependencies=["pytaigaclient"]
 )
+
+# --- Session Cleanup ---
+def cleanup_expired_sessions():
+    """Periodically cleanup expired sessions"""
+    while True:
+        try:
+            time.sleep(SESSION_CLEANUP_INTERVAL)
+            with session_lock:
+                expired_sessions = [
+                    sid for sid, session_data in active_sessions.items()
+                    if session_data.is_expired()
+                ]
+
+                for sid in expired_sessions:
+                    logger.info(f"Cleaning up expired session: {sid[:8]}...")
+                    active_sessions.pop(sid, None)
+
+                if expired_sessions:
+                    logger.info(f"Cleaned up {len(expired_sessions)} expired session(s)")
+
+        except Exception as e:
+            logger.error(f"Error in session cleanup: {e}", exc_info=True)
+
+# Start cleanup thread
+cleanup_thread = threading.Thread(target=cleanup_expired_sessions, daemon=True)
+cleanup_thread.start()
+logger.info(f"Session cleanup thread started (interval: {SESSION_CLEANUP_INTERVAL}s, expiry: {SESSION_EXPIRY}s)")
 
 # --- Helper Function for Session Validation ---
 
@@ -41,15 +205,31 @@ def _get_authenticated_client(session_id: str) -> TaigaClientWrapper:
     Retrieves the authenticated TaigaClientWrapper for a given session ID.
     Raises PermissionError if the session is invalid or not found.
     """
-    client = active_sessions.get(session_id)
-    # Also check if the client object itself exists and is authenticated
-    if not client or not client.is_authenticated:
-        logger.warning(f"Invalid or expired session ID provided: {session_id}")
-        # Raise PermissionError - FastMCP will map this to an appropriate error response
-        raise PermissionError(
-            f"Invalid or expired session ID: '{session_id}'. Please login again.")
-    logger.debug(f"Retrieved valid client for session ID: {session_id}")
-    return client
+    with session_lock:
+        session_data = active_sessions.get(session_id)
+
+        # Check if session exists
+        if not session_data:
+            logger.warning(f"Session not found: {session_id[:8]}")
+            raise PermissionError("Invalid session ID. Please login again.")
+
+        # Check if session is expired
+        if session_data.is_expired():
+            logger.warning(f"Session expired: {session_id[:8]}")
+            active_sessions.pop(session_id, None)
+            raise PermissionError("Session expired. Please login again.")
+
+        # Check if client is still authenticated
+        if not session_data.client.is_authenticated:
+            logger.warning(f"Client not authenticated for session: {session_id[:8]}")
+            active_sessions.pop(session_id, None)
+            raise PermissionError("Session invalid. Please login again.")
+
+        # Update last activity
+        session_data.update_activity()
+
+        logger.debug(f"Retrieved valid client for session: {session_id[:8]}")
+        return session_data.client
 
 # --- MCP Tools ---
 
@@ -68,7 +248,27 @@ def login(host: str, username: str, password: str) -> Dict[str, str]:
         A dictionary containing the session_id upon successful login.
         Example: {"session_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"}
     """
-    logger.info(f"Executing login tool for user '{username}' on host '{host}'")
+    # Validate inputs
+    try:
+        host = validate_host_url(host)
+        username = validate_string_input(username, "Username", max_length=150)
+        password = validate_string_input(password, "Password", max_length=128)
+    except ValueError as e:
+        logger.warning(f"Login validation failed: {e}")
+        raise e
+
+    # Use hashed username for logging
+    username_hash = hash_for_logging(username)
+    logger.info(f"Login attempt for user hash {username_hash} on host '{host}'")
+
+    # Rate limiting
+    if RATE_LIMIT_ENABLED:
+        rate_limit_key = f"login:{username_hash}"
+        if not login_rate_limiter.is_allowed(rate_limit_key):
+            logger.warning(f"Rate limit exceeded for login attempts: {username_hash}")
+            raise PermissionError(
+                f"Too many login attempts. Please try again in {RATE_LIMIT_LOGIN_WINDOW} seconds."
+            )
 
     try:
         wrapper = TaigaClientWrapper(host=host)
@@ -77,27 +277,43 @@ def login(host: str, username: str, password: str) -> Dict[str, str]:
         if login_successful:
             # Generate a unique session ID
             new_session_id = str(uuid.uuid4())
-            # Store the authenticated wrapper in our manual session store
-            active_sessions[new_session_id] = wrapper
-            logger.info(
-                f"Login successful for '{username}'. Created session ID: {new_session_id}")
+
+            # Create session data with timestamp
+            now = time.time()
+            session_data = SessionData(
+                client=wrapper,
+                created_at=now,
+                last_activity=now,
+                username=username
+            )
+
+            # Store the session
+            with session_lock:
+                active_sessions[new_session_id] = session_data
+
+            logger.info(f"Login successful for user hash {username_hash}. Session: {new_session_id[:8]}")
+
+            # Reset rate limiter on successful login
+            if RATE_LIMIT_ENABLED:
+                login_rate_limiter.reset(rate_limit_key)
+
             # Return the session ID to the client
-            return {"session_id": new_session_id}
+            return {
+                "session_id": new_session_id,
+                "expires_in": SESSION_EXPIRY
+            }
         else:
             # Should not happen if login raises exception on failure, but handle defensively
-            logger.error(
-                f"Login attempt for '{username}' returned False unexpectedly.")
+            logger.error(f"Login attempt for user hash {username_hash} returned False unexpectedly.")
             raise RuntimeError("Login failed for an unknown reason.")
 
     except (ValueError, TaigaException) as e:
-        logger.error(f"Login failed for '{username}': {e}", exc_info=False)
+        logger.warning(f"Login failed for user hash {username_hash}: {type(e).__name__}")
         # Re-raise the exception - FastMCP will turn it into an error response
         raise e
     except Exception as e:
-        logger.error(
-            f"Unexpected error during login for '{username}': {e}", exc_info=True)
-        raise RuntimeError(
-            f"An unexpected server error occurred during login: {e}")
+        logger.error(f"Unexpected error during login for user hash {username_hash}", exc_info=True)
+        raise RuntimeError("An unexpected server error occurred during login")
 
 # server_fastmcp.py
 
@@ -182,26 +398,26 @@ def get_project_by_slug(session_id: str, slug: str) -> Dict[str, Any]:
 @mcp.tool("create_project", description="Creates a new project.")
 def create_project(session_id: str, name: str, description: str, **kwargs) -> Dict[str, Any]:
     """Creates a new project. Requires name and description. Optional args (e.g., is_private) via kwargs."""
-    logger.info(
-        f"Executing create_project '{name}' for session {session_id[:8]} with data: {kwargs}")
+    # Validate inputs
+    name = validate_project_name(name)
+    description = validate_string_input(description, "Description", max_length=MAX_INPUT_LENGTH)
+
+    logger.info(f"Executing create_project for session {session_id[:8]}")
     taiga_client_wrapper = _get_authenticated_client(session_id)
-    if not name or not description:
-        raise ValueError("Project name and description are required.")
+
     try:
         # Use pytaigaclient syntax: client.projects.create(name=..., description=..., **kwargs)
         new_project = taiga_client_wrapper.api.projects.create(
             name=name, description=description, **kwargs
         )
-        logger.info(f"Project '{name}' created successfully (ID: {new_project.get('id', 'N/A')}).")
+        logger.info(f"Project created successfully (ID: {new_project.get('id', 'N/A')}).")
         return new_project # Return the created project dict
     except TaigaException as e:
-        logger.error(
-            f"Taiga API error creating project '{name}': {e}", exc_info=False)
+        logger.error(f"Taiga API error creating project: {type(e).__name__}", exc_info=False)
         raise e
     except Exception as e:
-        logger.error(
-            f"Unexpected error creating project '{name}': {e}", exc_info=True)
-        raise RuntimeError(f"Server error creating project: {e}")
+        logger.error(f"Unexpected error creating project", exc_info=True)
+        raise RuntimeError("Server error creating project")
 
 
 @mcp.tool("update_project", description="Updates details of an existing project.")
@@ -1165,28 +1381,27 @@ def get_project_members(session_id: str, project_id: int) -> List[Dict[str, Any]
 @mcp.tool("invite_project_user", description="Invites a user to a project by email with a specific role.")
 def invite_project_user(session_id: str, project_id: int, email: str, role_id: int) -> Dict[str, Any]:
     """Invites a user via email to join the project with the specified role ID."""
-    logger.info(
-        f"Executing invite_project_user {email} to project {project_id} (role {role_id}), session {session_id[:8]}...")
-    taiga_client_wrapper = _get_authenticated_client(session_id) # Use wrapper variable name
-    if not email:
-        raise ValueError("Email cannot be empty.")
+    # Validate email
+    email = validate_email(email)
+    email_hash = hash_for_logging(email)
+
+    logger.info(f"Executing invite_project_user (email hash: {email_hash}) to project {project_id}, session {session_id[:8]}")
+    taiga_client_wrapper = _get_authenticated_client(session_id)
+
     try:
         # Use pytaigaclient memberships resource invite method
-        # Check pytaigaclient signature for param names (project, email, role_id)
         invitation_result = taiga_client_wrapper.api.memberships.invite(
-            project=project_id, email=email, role_id=role_id # Changed project_id to project
+            project=project_id, email=email, role_id=role_id
         )
-        logger.info(f"Invitation request sent to {email} for project {project_id}.")
+        logger.info(f"Invitation request sent for project {project_id}.")
         # Return the result from the invite call (might be dict or status)
         return invitation_result if isinstance(invitation_result, dict) else {"status": "invited", "email": email, "details": invitation_result}
     except TaigaException as e:
-        logger.error(
-            f"Taiga API error inviting user {email} to project {project_id}: {e}", exc_info=False)
+        logger.error(f"Taiga API error inviting user to project {project_id}: {type(e).__name__}", exc_info=False)
         raise e
     except Exception as e:
-        logger.error(
-            f"Unexpected error inviting user {email} to project {project_id}: {e}", exc_info=True)
-        raise RuntimeError(f"Server error inviting user: {e}")
+        logger.error(f"Unexpected error inviting user to project {project_id}", exc_info=True)
+        raise RuntimeError("Server error inviting user")
 
 
 # --- Wiki Tools ---
@@ -1245,50 +1460,69 @@ def get_wiki_page(session_id: str, wiki_page_id: int) -> Dict[str, Any]:
 def logout(session_id: str) -> Dict[str, Any]:
     """Logs out the current session, invalidating the session_id."""
     logger.info(f"Executing logout for session {session_id[:8]}...")
-    # Remove from dict, return None if not found
-    client_wrapper = active_sessions.pop(session_id, None) # Use consistent var name
-    if client_wrapper:
+
+    with session_lock:
+        session_data = active_sessions.pop(session_id, None)
+
+    if session_data:
         logger.info(f"Session {session_id[:8]} logged out successfully.")
         # No specific API logout call needed usually for token-based auth
         return {"status": "logged_out", "session_id": session_id}
     else:
-        logger.warning(
-            f"Attempted to log out non-existent session: {session_id}")
+        logger.warning(f"Attempted to log out non-existent session: {session_id[:8]}")
         return {"status": "session_not_found", "session_id": session_id}
 
 
 @mcp.tool("session_status", description="Checks if the provided session_id is currently active and valid.")
 def session_status(session_id: str) -> Dict[str, Any]:
     """Checks the validity of the current session_id."""
-    logger.debug(
-        f"Executing session_status check for session {session_id[:8]}...")
-    client_wrapper = active_sessions.get(session_id) # Use consistent var name
-    if client_wrapper and client_wrapper.is_authenticated:
-        try:
-            # Use pytaigaclient users.me() call
-            me = client_wrapper.api.users.me()
-            # Extract username from the returned dict
-            username = me.get('username', 'Unknown')
-            logger.debug(
-                f"Session {session_id[:8]} is active for user {username}.")
-            return {"status": "active", "session_id": session_id, "username": username}
-        except TaigaException:
-            logger.warning(
-                f"Session {session_id[:8]} found but token seems invalid (API check failed).")
-            # Clean up invalid session
-            active_sessions.pop(session_id, None)
-            return {"status": "inactive", "reason": "token_invalid", "session_id": session_id}
-        except Exception as e: # Catch broader exceptions during the 'me' call
-             logger.error(f"Unexpected error during session status check for {session_id[:8]}: {e}", exc_info=True)
-             # Return a distinct status for unexpected errors during check
-             return {"status": "error", "reason": "check_failed", "session_id": session_id}
-    elif client_wrapper: # Client exists but not authenticated (shouldn't happen with current login logic)
-        logger.warning(
-            f"Session {session_id[:8]} exists but client wrapper is not authenticated.")
-        return {"status": "inactive", "reason": "not_authenticated", "session_id": session_id}
-    else: # Session ID not found
+    logger.debug(f"Executing session_status check for session {session_id[:8]}...")
+
+    with session_lock:
+        session_data = active_sessions.get(session_id)
+
+    if not session_data:
         logger.debug(f"Session {session_id[:8]} not found.")
         return {"status": "inactive", "reason": "not_found", "session_id": session_id}
+
+    # Check if session is expired
+    if session_data.is_expired():
+        logger.warning(f"Session {session_id[:8]} is expired.")
+        with session_lock:
+            active_sessions.pop(session_id, None)
+        return {"status": "inactive", "reason": "expired", "session_id": session_id}
+
+    # Check if client is still authenticated
+    if not session_data.client.is_authenticated:
+        logger.warning(f"Session {session_id[:8]} client not authenticated.")
+        with session_lock:
+            active_sessions.pop(session_id, None)
+        return {"status": "inactive", "reason": "not_authenticated", "session_id": session_id}
+
+    try:
+        # Use pytaigaclient users.me() call
+        me = session_data.client.api.users.me()
+        username = me.get('username', 'Unknown')
+
+        # Calculate time remaining
+        time_remaining = SESSION_EXPIRY - (time.time() - session_data.last_activity)
+
+        logger.debug(f"Session {session_id[:8]} is active.")
+        return {
+            "status": "active",
+            "session_id": session_id,
+            "username": username,
+            "time_remaining": int(time_remaining),
+            "created_at": datetime.fromtimestamp(session_data.created_at).isoformat()
+        }
+    except TaigaException:
+        logger.warning(f"Session {session_id[:8]} found but token invalid (API check failed).")
+        with session_lock:
+            active_sessions.pop(session_id, None)
+        return {"status": "inactive", "reason": "token_invalid", "session_id": session_id}
+    except Exception as e:
+        logger.error(f"Unexpected error during session status check for {session_id[:8]}", exc_info=True)
+        return {"status": "error", "reason": "check_failed", "session_id": session_id}
 
 
 # --- Run the server ---

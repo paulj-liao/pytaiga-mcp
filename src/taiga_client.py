@@ -33,24 +33,20 @@ class TaigaClientWrapper:
         Uses pytaigaclient.
         """
         try:
-            logger.info(
-                f"Attempting login for user '{username}' on {self.host}")
+            logger.info(f"Attempting authentication on {self.host}")
             # Initialize the client here
             api_instance = TaigaClient(host=self.host)
             # Use the auth resource's login method
             api_instance.auth.login(username=username, password=password)
             self.api = api_instance
-            logger.info(
-                f"Login successful for user '{username}'. Auth token acquired.")
+            logger.info("Authentication successful. Auth token acquired.")
             return True
         except TaigaException as e:
-            logger.error(
-                f"Taiga login failed for user '{username}': {e}", exc_info=False)
+            logger.warning(f"Taiga authentication failed: {type(e).__name__}")
             self.api = None
             raise e
         except Exception as e:
-            logger.error(
-                f"An unexpected error occurred during login for user '{username}': {e}", exc_info=True)
+            logger.error("Unexpected error during authentication", exc_info=True)
             self.api = None
             # Wrap unexpected errors in TaigaException if needed, or re-raise
             raise TaigaException(f"Unexpected login error: {e}")
