@@ -1,10 +1,12 @@
 # taiga_client.py
 from typing import Optional
 import logging
+
 # Replace python-taiga import
 # from taiga import TaigaAPI
 # from taiga.exceptions import TaigaException
 from pytaigaclient import TaigaClient  # Import the new client
+
 # Assuming pytaigaclient also has a base exception
 from pytaigaclient.exceptions import TaigaException
 
@@ -66,12 +68,11 @@ class TaigaClientWrapper:
     def _ensure_authenticated(self):
         """Internal helper to check authentication before API calls."""
         if not self.is_authenticated:
-            logger.error(
-                "Action required authentication, but client is not logged in.")
+            logger.error("Action required authentication, but client is not logged in.")
             # Use a standard exception type that FastMCP might handle better,
             # or a custom one if needed. PermissionError fits well.
-            raise PermissionError(
-                "Client not authenticated. Please login first.")
+            raise PermissionError("Client not authenticated. Please login first.")
+
 
 # No changes needed to _ensure_authenticated or is_authenticated property logic,
 # just the types and method calls within login.
